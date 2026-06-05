@@ -233,23 +233,11 @@ export class AlexaApi extends Homey.SimpleClass {
     });
   }
 
-  private async init(options: { cookie: string | undefined; page: string; language: string; reconnect?: boolean }): Promise<void> {
-    const isReconnect = !!options.reconnect && !!options.cookie;
-    this.logger.info(isReconnect ? 'Reconnecting with saved cookie' : options.cookie ? 'Using cookie' : 'No cookie found');
-
+  private buildOptions(page: string, language: string, cookie: string | undefined, isReconnect: boolean) {
     // Defensive: strip protocol/www prefix in case a full URL was stored (legacy settings).
-    const page = options.page.replace(/^https?:\/\/(www\.)?/, '');
+    const cleanPage = page.replace(/^https?:\/\/(www\.)?/, '');
 
-    // On reconnect, force the library to refresh the cookie instead of reusing
-    // a potentially stale access token. The library skips refresh when
-    // tokenDate < 24h, but the access token may have expired much sooner.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let cookie: any = options.cookie;
-    if (isReconnect && cookie && typeof cookie === 'object' && cookie.tokenDate) {
-      cookie = { ...cookie, tokenDate: 0 };
-    }
-
-    const opts = {
+    return {
       cookie,
       apiUserAgentPostfix: '',
       logger: (message?: string) => {
@@ -260,21 +248,26 @@ export class AlexaApi extends Homey.SimpleClass {
       },
       deviceAppName: 'Homey Echo Integration',
       proxyLogLevel: 'warn',
-      alexaServiceHost: SERVERS[page] || undefined,
-      amazonPage: page,
+      alexaServiceHost: SERVERS[cleanPage] || undefined,
+      amazonPage: cleanPage,
       cookieRefreshInterval: 4 * 24 * 60 * 60 * 1000,
       usePushConnection: true,
-      acceptLanguage: LANG_MAP[options.language] || 'en-US',
-      // On reconnect with a saved cookie, don't start the proxy server — it's only
-      // needed for the initial browser-based authentication flow.
+      acceptLanguage: LANG_MAP[language] || 'en-US',
       proxyOnly: !isReconnect,
       proxyOwnIp: IP.address('private'),
       proxyListenBind: '0.0.0.0',
       proxyPort: 3081,
       setupProxy: !isReconnect,
-      amazonPageProxyLanguage: LANG_MAP[options.language]?.replace('-', '_') || 'en_US',
+      amazonPageProxyLanguage: LANG_MAP[language]?.replace('-', '_') || 'en_US',
       proxyCloseWindowHTML: SUCCESS_HTML,
     };
+  }
+
+  private async init(options: { cookie: string | undefined; page: string; language: string; reconnect?: boolean }): Promise<void> {
+    const isReconnect = !!options.reconnect && !!options.cookie;
+    this.logger.info(isReconnect ? 'Reconnecting with saved cookie' : options.cookie ? 'Using cookie' : 'No cookie found');
+
+    const opts = this.buildOptions(options.page, options.language, options.cookie, isReconnect);
 
     this.alexaServiceHost = opts.alexaServiceHost;
     await promisifyWithOptions(this.alexa.init.bind(this.alexa), { ...opts });
@@ -318,6 +311,58 @@ export class AlexaApi extends Homey.SimpleClass {
     }
   }
 
+  /**
+   * Pre-validate a saved cookie by setting it on the library instance and
+   * calling checkAuthentication. Returns true if the cookie is still valid,
+   * meaning init() can use the library's fast path (skip refreshCookie).
+   * If valid, bumps tokenDate so the library's 24h freshness gate passes.
+   */
+  private async preValidateCookie(auth: Record<string, unknown>): Promise<boolean> {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      this.alexa.setCookie(auth as any);
+      if (!this.alexa.cookie || !this.alexa.csrf) {
+        this.logger.info('Pre-validate: cookie/csrf not extracted from saved data');
+        return false;
+      }
+
+      // Ensure baseUrl is set so checkAuthentication can make HTTP calls.
+      // Prefer the amazonPage stored in the cookie data, fall back to the
+      // library's previous _options, then to a sensible default.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const opts = (this.alexa as any)._options;
+      const page = (auth.amazonPage as string) || opts?.amazonPage || 'amazon.de';
+      const serviceHost = opts?.alexaServiceHost || SERVERS[page.replace(/^https?:\/\/(www\.)?/, '')] || undefined;
+      this.alexa.baseUrl = serviceHost || `alexa.${page}`;
+
+      const authenticated = await new Promise<boolean>((resolve, reject) =>
+        this.alexa.checkAuthentication((result: unknown, error: unknown) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve(result as boolean);
+          }
+        }),
+      );
+
+      if (authenticated) {
+        this.logger.info('Pre-validate: saved cookie is still valid, bumping tokenDate');
+        // Bump tokenDate so the library's 24h freshness gate in getCookie()
+        // takes the fast path and skips the destructive refreshCookie() call.
+        if (auth && typeof auth === 'object' && 'tokenDate' in auth) {
+          (auth as Record<string, unknown>).tokenDate = Date.now();
+        }
+        return true;
+      }
+
+      this.logger.info('Pre-validate: saved cookie is no longer valid');
+      return false;
+    } catch (e) {
+      this.logger.info(`Pre-validate: check failed (${e instanceof Error ? e.message : e})`);
+      return false;
+    }
+  }
+
   public async connect(options: { page: string; language: string }): Promise<ConnectionResult> {
     this.logger.info('Connecting');
     const auth = this.authData;
@@ -333,6 +378,27 @@ export class AlexaApi extends Homey.SimpleClass {
     }
 
     this.setState(ConnectionState.CONNECTING);
+
+    // Build the options object early so that alexa-remote2 has a proper _options
+    // before preValidateCookie calls setCookie(), which needs to write onto
+    // _options (line 150 in alexa-remote.js). Without this, a fresh AlexaRemote
+    // instance has _options = undefined and the call crashes.
+    const opts = this.buildOptions(options.page, options.language, auth, !!isReconnect);
+
+    // On reconnect, pre-validate the saved cookie against the Alexa API.
+    // If the localCookie is still valid, bump tokenDate so the library's
+    // init() takes the fast path and skips refreshCookie(), which can
+    // fail destructively when loginCookie session cookies have expired.
+    if (isReconnect && auth && typeof auth === 'object') {
+      // Set real _options (not a stub) so setCookie + httpsGetCall have
+      // everything they need during the pre-validation request.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (this.alexa as any)._options = opts;
+      const stillValid = await this.preValidateCookie(auth as Record<string, unknown>);
+      if (!stillValid) {
+        this.logger.info('Saved cookie failed pre-validation, full re-auth may be needed');
+      }
+    }
 
     let result: ConnectionResult;
 
@@ -361,9 +427,9 @@ export class AlexaApi extends Homey.SimpleClass {
       }
     }
 
-    // Everything below only runs on success or proxy — never on error
-
-    if (this.alexa.cookieData) {
+    // Only persist cookieData when init() actually connected (not when it
+    // fell through to the proxy flow, which means auth failed).
+    if (result.type === 'connected' && this.alexa.cookieData) {
       this.logger.info('Authenticated');
       this.authData = this.alexa.cookieData;
       this.emit('authenticated', this.authData);
